@@ -1,0 +1,10 @@
+{
+  "name": "KiremData",
+  "description": "Aplikasi pesan instan jaringan lokal tanpa internet dengan enkripsi end-to-end, grup kantor, pesan suara, dan transfer dokumen berkecepatan tinggi via Wi-Fi Direct.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

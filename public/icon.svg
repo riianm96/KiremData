@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="112" fill="#0B141A"/>
+  <rect x="24" y="24" width="464" height="464" rx="92" fill="#111B21" stroke="#00A884" stroke-opacity="0.28" stroke-width="4"/>
+  <!-- Speech Bubble -->
+  <path d="M256 108C171.0 108 102 172.3 102 251.5C102 285.2 114.6 316.2 135.6 340.6L118.2 396.4C116.4 402.1 121.8 407.4 127.5 405.5L188.4 385.1C209.1 391.5 232.0 395.0 256 395.0C341.0 395.0 410 330.7 410 251.5C410 172.3 341.0 108 256 108Z" fill="#00A884"/>
+  <!-- Wi-Fi Direct / E2EE Lock Emblem Inside Bubble -->
+  <path d="M204 226C218.5 212.5 236.5 205 256 205C275.5 205 293.5 212.5 308 226" stroke="#0B141A" stroke-width="18" stroke-linecap="round"/>
+  <path d="M227 251C235.2 243.5 245.2 239.5 256 239.5C266.8 239.5 276.8 243.5 285 251" stroke="#0B141A" stroke-width="18" stroke-linecap="round"/>
+  <rect x="234" y="274" width="44" height="36" rx="8" fill="#0B141A"/>
+  <path d="M243 274V265C243 257.8 248.8 252 256 252C263.2 252 269 257.8 269 265V274" stroke="#0B141A" stroke-width="8" stroke-linecap="round"/>
+</svg>
