@@ -12,13 +12,32 @@ export function AccessGate({ children }: AccessGateProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
-  const checkSession = async () => {
+  const isEmbeddedFrame = () => {
+    try {
+      return window.self !== window.top;
+    } catch {
+      return true;
+    }
+  };
+
+  const checkSession = async (expiredNotice = false) => {
     setError('');
     try {
-      const response = await fetch('/api/auth/session', { cache: 'no-store' });
+      const embeddedQuery = isEmbeddedFrame() ? '?embedded=1' : '';
+      const response = await fetch(`/api/auth/session${embeddedQuery}`, { cache: 'no-store' });
       if (!response.ok) throw new Error('Server tidak dapat memeriksa sesi.');
-      const result = (await response.json()) as { authenticated?: boolean };
-      setAuthenticated(Boolean(result.authenticated));
+      const result = (await response.json()) as {
+        authenticated?: boolean;
+        requireAccessCode?: boolean;
+        configError?: string;
+      };
+      const isAuthed = Boolean(result.authenticated) && !result.configError;
+      setAuthenticated(isAuthed);
+      if (result.configError) {
+        setError(result.configError);
+      } else if (!isAuthed && expiredNotice) {
+        setError('Sesi berakhir atau server dimulai ulang. Silakan masuk kembali.');
+      }
     } catch {
       setAuthenticated(false);
       setError('Tidak dapat terhubung ke KiremData Hub. Pastikan server aktif lalu coba lagi.');
@@ -28,9 +47,8 @@ export function AccessGate({ children }: AccessGateProps) {
   useEffect(() => {
     void checkSession();
     const handleAuthRequired = () => {
-      setAuthenticated(false);
       setAccessCode('');
-      setError('Sesi berakhir atau server dimulai ulang. Silakan masuk kembali.');
+      void checkSession(true);
     };
     window.addEventListener('kiremdata:auth-required', handleAuthRequired);
     return () => {
@@ -43,12 +61,7 @@ export function AccessGate({ children }: AccessGateProps) {
     setBusy(true);
     setError('');
     try {
-      let embedded = false;
-      try {
-        embedded = window.self !== window.top;
-      } catch {
-        embedded = true;
-      }
+      const embedded = isEmbeddedFrame();
       const response = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

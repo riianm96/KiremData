@@ -21,9 +21,15 @@ const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024; // 4 GB max single file
 const STAGED_FILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_COOKIE = 'kiremdata_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const requireAccessCodeRaw = process.env.KIREMDATA_REQUIRE_ACCESS_CODE?.trim().toLowerCase();
+const requireAccessCode = requireAccessCodeRaw !== 'false';
 const configuredAccessCode = process.env.KIREMDATA_ACCESS_CODE?.trim();
-if (configuredAccessCode && configuredAccessCode.length < 12) {
-  throw new Error('KIREMDATA_ACCESS_CODE harus berisi minimal 12 karakter.');
+const accessCodeConfigError =
+  requireAccessCode && configuredAccessCode && configuredAccessCode.length < 12
+    ? 'Konfigurasi KIREMDATA_ACCESS_CODE harus berisi minimal 12 karakter. Perbarui nilai di Secrets atau .env.'
+    : null;
+if (accessCodeConfigError) {
+  console.error(accessCodeConfigError);
 }
 const accessCode = configuredAccessCode || crypto.randomBytes(18).toString('base64url');
 const authSessions = new Map<string, number>();
@@ -40,9 +46,11 @@ const authCleanupTimer = setInterval(() => {
 }, 15 * 60 * 1000);
 authCleanupTimer.unref();
 
-if (!configuredAccessCode) {
+if (requireAccessCode && !configuredAccessCode) {
   console.log(`Kode akses KiremData (berubah saat server restart): ${accessCode}`);
   console.log('Set KIREMDATA_ACCESS_CODE di .env untuk menggunakan kode tetap.');
+} else if (!requireAccessCode) {
+  console.log('KIREMDATA_REQUIRE_ACCESS_CODE=false: gerbang kode akses dimatikan.');
 }
 
 function getCookieValue(header: string | undefined, cookieName: string): string | undefined {
@@ -53,7 +61,7 @@ function getCookieValue(header: string | undefined, cookieName: string): string 
   return undefined;
 }
 
-function isAuthenticated(req: http.IncomingMessage): boolean {
+function hasValidSessionCookie(req: http.IncomingMessage): boolean {
   const token = getCookieValue(req.headers.cookie, SESSION_COOKIE);
   if (!token) return false;
   const expiresAt = authSessions.get(token);
@@ -62,6 +70,11 @@ function isAuthenticated(req: http.IncomingMessage): boolean {
     return false;
   }
   return true;
+}
+
+function isAuthenticated(req: http.IncomingMessage): boolean {
+  if (!requireAccessCode) return true;
+  return hasValidSessionCookie(req);
 }
 
 function getAuthenticatedPeerId(req: http.IncomingMessage): string | undefined {
@@ -461,11 +474,67 @@ async function startServer() {
   app.set('trust proxy', resolveTrustProxySetting(process.env.KIREMDATA_TRUST_PROXY));
   app.use(express.json({ limit: '4mb' }));
 
+  const buildSessionCookieAttributes = (req: express.Request): { sameSite: string; secure: string } => {
+    const originOrReferer =
+      typeof req.headers.origin === 'string'
+        ? req.headers.origin
+        : typeof req.headers.referer === 'string'
+          ? req.headers.referer
+          : '';
+    const trustProxyFn = app.get('trust proxy fn') as ((addr: string, i: number) => boolean) | undefined;
+    const isTrustedProxy =
+      Boolean(trustProxyFn && req.socket.remoteAddress && trustProxyFn(req.socket.remoteAddress, 0)) ||
+      isRunningInCloudContainer();
+    const effectiveSecure = req.secure || (isTrustedProxy && originOrReferer.startsWith('https://'));
+    const isCrossSiteContext =
+      req.body?.embedded === true ||
+      req.query?.embedded === '1' ||
+      req.headers['sec-fetch-site'] === 'cross-site';
+    return {
+      sameSite: effectiveSecure && isCrossSiteContext ? 'SameSite=None; Partitioned' : 'SameSite=Strict',
+      secure: effectiveSecure ? '; Secure' : '',
+    };
+  };
+
   app.get('/api/auth/session', (req, res) => {
-    res.json({ authenticated: isAuthenticated(req) });
+    if (!requireAccessCode) {
+      if (!hasValidSessionCookie(req)) {
+        const token = crypto.randomBytes(32).toString('base64url');
+        authSessions.set(token, Date.now() + SESSION_TTL_MS);
+        const { sameSite, secure } = buildSessionCookieAttributes(req);
+        res.setHeader(
+          'Set-Cookie',
+          `${SESSION_COOKIE}=${token}; HttpOnly; ${sameSite}; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure}`,
+        );
+      }
+      res.json({ authenticated: true, requireAccessCode: false });
+      return;
+    }
+    res.json({
+      authenticated: !accessCodeConfigError && isAuthenticated(req),
+      requireAccessCode: true,
+      configError: accessCodeConfigError || undefined,
+    });
   });
 
   app.post('/api/auth/login', (req, res) => {
+    if (!requireAccessCode) {
+      if (!hasValidSessionCookie(req)) {
+        const token = crypto.randomBytes(32).toString('base64url');
+        authSessions.set(token, Date.now() + SESSION_TTL_MS);
+        const { sameSite, secure } = buildSessionCookieAttributes(req);
+        res.setHeader(
+          'Set-Cookie',
+          `${SESSION_COOKIE}=${token}; HttpOnly; ${sameSite}; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure}`,
+        );
+      }
+      res.json({ authenticated: true, requireAccessCode: false });
+      return;
+    }
+    if (accessCodeConfigError) {
+      res.status(503).json({ error: accessCodeConfigError });
+      return;
+    }
     const remoteAddress = (req.socket.remoteAddress || '').replace('::ffff:', '');
     const loopback = remoteAddress === '127.0.0.1' || remoteAddress === '::1';
     if (!req.secure && !loopback) {
@@ -495,10 +564,7 @@ async function startServer() {
     loginFailures.delete(ip);
     const token = crypto.randomBytes(32).toString('base64url');
     authSessions.set(token, Date.now() + SESSION_TTL_MS);
-    const isCrossSiteContext =
-      req.body?.embedded === true || req.headers['sec-fetch-site'] === 'cross-site';
-    const sameSite = req.secure && isCrossSiteContext ? 'SameSite=None; Partitioned' : 'SameSite=Strict';
-    const secure = req.secure ? '; Secure' : '';
+    const { sameSite, secure } = buildSessionCookieAttributes(req);
     res.setHeader(
       'Set-Cookie',
       `${SESSION_COOKIE}=${token}; HttpOnly; ${sameSite}; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure}`,
@@ -512,11 +578,9 @@ async function startServer() {
       authSessions.delete(token);
       authSessionPeerIds.delete(token);
     }
-    const isCrossSiteContext =
-      req.body?.embedded === true || req.headers['sec-fetch-site'] === 'cross-site';
-    const sameSite = req.secure && isCrossSiteContext ? 'SameSite=None; Partitioned' : 'SameSite=Strict';
-    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; ${sameSite}; Path=/; Max-Age=0${req.secure ? '; Secure' : ''}`);
-    res.json({ authenticated: false });
+    const { sameSite, secure } = buildSessionCookieAttributes(req);
+    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; ${sameSite}; Path=/; Max-Age=0${secure}`);
+    res.json({ authenticated: !requireAccessCode });
   });
 
   app.use('/api', (req, res, next) => {
@@ -1087,16 +1151,32 @@ async function startServer() {
   server.on('upgrade', (request, socket, head) => {
     try {
       const origin = request.headers.origin;
-      const expectedOrigin = `http${(request.socket as { encrypted?: boolean }).encrypted ? 's' : ''}://${request.headers.host}`;
       const pathname = new URL(
         request.url || '/',
         `http://${request.headers.host || 'localhost'}`,
       ).pathname;
+      const allowedHosts = new Set<string>();
+      if (typeof request.headers.host === 'string' && request.headers.host) {
+        allowedHosts.add(request.headers.host.toLowerCase());
+      }
+      const trustProxyFn = app.get('trust proxy fn') as ((addr: string, i: number) => boolean) | undefined;
+      const socketIp = request.socket.remoteAddress || '';
+      const fromTrustedProxy =
+        Boolean(trustProxyFn && socketIp && trustProxyFn(socketIp, 0)) ||
+        isRunningInCloudContainer();
+      const forwardedHostHeader = request.headers['x-forwarded-host'];
+      const forwardedHost = typeof forwardedHostHeader === 'string'
+        ? forwardedHostHeader.split(',')[0].trim().toLowerCase()
+        : '';
+      if (fromTrustedProxy && forwardedHost) {
+        allowedHosts.add(forwardedHost);
+      }
+      const originHost = typeof origin === 'string' ? new URL(origin).host.toLowerCase() : '';
       if (
         pathname === '/ws' &&
         isAuthenticated(request) &&
-        typeof origin === 'string' &&
-        new URL(origin).host === new URL(expectedOrigin).host
+        originHost.length > 0 &&
+        allowedHosts.has(originHost)
       ) {
         wss.handleUpgrade(request, socket, head, (ws) => {
           wss.emit('connection', ws, request);
