@@ -54,6 +54,8 @@ interface IncomingP2PTransfer {
   windowBytes: number;
   lastSpeedBytesPerSec: number;
   fileEndReceived: boolean;
+  pendingDecryptions: number;
+  endWaitCount: number;
   finalSha256?: string;
   finalized: boolean;
   endTimeout?: ReturnType<typeof setTimeout>;
@@ -104,6 +106,16 @@ interface P2PCallbacks {
     sha256: string;
     verified: boolean;
     speedBytesPerSec: number;
+    encrypted: boolean;
+  }) => void;
+  onReceiveError: (info: {
+    fileId: string;
+    roomId: string;
+    peerId: string;
+    peerName: string;
+    fileName: string;
+    fileSize: number;
+    mimeType: string;
     encrypted: boolean;
   }) => void;
   getRoomOrPeerAesKey: (roomId: string, peerId: string) => Promise<CryptoKey | null>;
@@ -990,6 +1002,29 @@ export class WifiDirectManager {
     }
   }
 
+  private failIncomingTransfer(transfer: IncomingP2PTransfer, peerId: string): void {
+    if (transfer.finalized) return;
+    transfer.finalized = true;
+    if (transfer.endTimeout) clearTimeout(transfer.endTimeout);
+    this.incomingTransfers.delete(transfer.fileId);
+    this.streamIdToFileId.delete(transfer.streamId);
+    this.earlyChunksByStream.delete(transfer.streamId);
+    if (transfer.opfsState) {
+      void transfer.opfsState.writable.abort().catch(() => {});
+      void transfer.opfsState.root.removeEntry(transfer.opfsState.fileName).catch(() => {});
+    }
+    this.callbacks.onReceiveError({
+      fileId: transfer.fileId,
+      roomId: transfer.roomId,
+      peerId,
+      peerName: transfer.senderName,
+      fileName: transfer.fileName,
+      fileSize: transfer.fileSize,
+      mimeType: transfer.mimeType,
+      encrypted: transfer.encrypted,
+    });
+  }
+
   private scheduleChunkWrite(
     transfer: IncomingP2PTransfer,
     chunkIndex: number,
@@ -1032,7 +1067,7 @@ export class WifiDirectManager {
       return;
     }
 
-    if (!transfer.encrypted || (!rawIv && !legacyIv)) {
+    if (!transfer.encrypted) {
       this.scheduleChunkWrite(transfer, chunkIndex, rawPayloadView);
       this.emitReceiveProgress(transfer, peerId);
 
@@ -1041,35 +1076,37 @@ export class WifiDirectManager {
       }
       return;
     }
+    if (!rawIv && !legacyIv) {
+      this.failIncomingTransfer(transfer, peerId);
+      return;
+    }
 
+    transfer.pendingDecryptions += 1;
     void (async () => {
       let chunkBuf: ArrayBuffer;
       const aesKey = transfer.aesKeyPromise ? await transfer.aesKeyPromise : null;
-      if (aesKey) {
-        try {
-          chunkBuf = rawIv
-            ? await decryptBinaryBufferRaw(aesKey, rawIv, rawPayloadView)
-            : await decryptBinaryBuffer(
-                aesKey,
-                legacyIv!,
-                legacyRawBuffer ?? rawPayloadView.slice().buffer,
-              );
-        } catch {
-          chunkBuf = rawPayloadView.slice().buffer;
-        }
-      } else {
-        chunkBuf = rawPayloadView.slice().buffer;
-      }
+      if (!aesKey) throw new Error('Kunci dekripsi file tidak tersedia.');
+      chunkBuf = rawIv
+        ? await decryptBinaryBufferRaw(aesKey, rawIv, rawPayloadView)
+        : await decryptBinaryBuffer(
+            aesKey,
+            legacyIv!,
+            legacyRawBuffer ?? rawPayloadView.slice().buffer,
+          );
 
       if (transfer.finalized) return;
 
       this.scheduleChunkWrite(transfer, chunkIndex, chunkBuf);
       this.emitReceiveProgress(transfer, peerId);
 
-      if (transfer.fileEndReceived && transfer.receivedCount >= transfer.totalChunks) {
-        await this.finalizeIncomingTransfer(transfer.fileId, peerId, transfer.finalSha256);
-      }
-    })();
+    })()
+      .catch(() => this.failIncomingTransfer(transfer, peerId))
+      .finally(() => {
+        transfer.pendingDecryptions = Math.max(0, transfer.pendingDecryptions - 1);
+        if (!transfer.finalized && transfer.fileEndReceived && transfer.receivedCount >= transfer.totalChunks) {
+          void this.finalizeIncomingTransfer(transfer.fileId, peerId, transfer.finalSha256);
+        }
+      });
   }
 
   private setupDataChannel(peerId: string, lane: number, dc: RTCDataChannel): void {
@@ -1158,6 +1195,8 @@ export class WifiDirectManager {
               windowBytes: 0,
               lastSpeedBytesPerSec: 0,
               fileEndReceived: false,
+              pendingDecryptions: 0,
+              endWaitCount: 0,
               finalized: false,
               opfsPromise: useOpfs ? openOpfsTempWriter(streamId) : null,
               opfsState: null,
@@ -1219,9 +1258,20 @@ export class WifiDirectManager {
             if (transfer.receivedCount >= transfer.totalChunks) {
               void this.finalizeIncomingTransfer(msg.fileId, peerId, msg.sha256);
             } else {
-              transfer.endTimeout = setTimeout(() => {
+              const waitForPendingChunks = () => {
+                if (transfer.finalized) return;
+                if (transfer.pendingDecryptions > 0 && transfer.endWaitCount < 5) {
+                  transfer.endWaitCount += 1;
+                  transfer.endTimeout = setTimeout(waitForPendingChunks, 2500);
+                  return;
+                }
+                if (transfer.receivedCount !== transfer.totalChunks) {
+                  this.failIncomingTransfer(transfer, peerId);
+                  return;
+                }
                 void this.finalizeIncomingTransfer(msg.fileId, peerId, transfer.finalSha256);
-              }, 2500);
+              };
+              transfer.endTimeout = setTimeout(waitForPendingChunks, 2500);
             }
           }
         } catch {
@@ -1288,6 +1338,13 @@ export class WifiDirectManager {
   ): Promise<void> {
     const transfer = this.incomingTransfers.get(fileId);
     if (!transfer || transfer.finalized) return;
+    if (
+      transfer.receivedCount !== transfer.totalChunks ||
+      transfer.receivedBytes !== transfer.fileSize
+    ) {
+      this.failIncomingTransfer(transfer, peerId);
+      return;
+    }
     transfer.finalized = true;
     if (transfer.endTimeout) {
       clearTimeout(transfer.endTimeout);
@@ -1335,12 +1392,27 @@ export class WifiDirectManager {
     transfer.chunks = [];
 
     let actualSha = expectedSha || '';
-    let verified = true;
+    let verified = false;
 
     if (transfer.encrypted && blob.size <= MAX_HASH_BYTES && expectedSha) {
       const fullBuffer = await blob.arrayBuffer();
       actualSha = await sha256Hex(fullBuffer);
       verified = actualSha === expectedSha;
+    }
+
+    if (expectedSha && blob.size <= MAX_HASH_BYTES && actualSha !== expectedSha) {
+      if (opfsState) void opfsState.root.removeEntry(opfsState.fileName).catch(() => {});
+      this.callbacks.onReceiveError({
+        fileId: transfer.fileId,
+        roomId: transfer.roomId,
+        peerId,
+        peerName: transfer.senderName,
+        fileName: transfer.fileName,
+        fileSize: transfer.fileSize,
+        mimeType: transfer.mimeType,
+        encrypted: transfer.encrypted,
+      });
+      return;
     }
 
     const elapsedSec = Math.max(0.02, (performance.now() - transfer.startedAt) / 1000);

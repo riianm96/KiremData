@@ -1,6 +1,7 @@
 import { createRoot } from 'react-dom/client';
 import { registerSW } from 'virtual:pwa-register';
 import App from './App.tsx';
+import { AccessGate } from './components/AccessGate';
 import {
   notifyPwaNeedRefresh,
   notifyPwaOfflineReady,
@@ -41,4 +42,8 @@ if (import.meta.env.DEV && typeof navigator !== 'undefined' && 'serviceWorker' i
   });
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(
+  <AccessGate>
+    <App />
+  </AccessGate>,
+);

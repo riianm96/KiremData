@@ -59,7 +59,7 @@ export function SecurityModal({
               {room.type === 'group' ? `Grup "${room.name}" Terenkripsi` : `Obrolan dengan ${targetPeer?.name}`}
             </h4>
             <p className="text-xs text-[#8696A0] mt-1.5 leading-relaxed">
-              Setiap pesan teks, pesan suara, dan blok file Wi-Fi Direct dienkripsi di perangkat pengirim dengan AES-GCM 256-bit menggunakan pertukaran kunci ECDH kurva P-256.
+              Pesan teks dan suara dienkripsi dengan AES-GCM 256-bit dan pertukaran kunci ECDH P-256. File dienkripsi saat dikirim lewat P2P; jika enkripsi aktif dan P2P tidak tersedia, transfer dihentikan. Menonaktifkan enkripsi file mengizinkan transfer melalui hub tanpa enkripsi ujung-ke-ujung.
             </p>
           </div>
 

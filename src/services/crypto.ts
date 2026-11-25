@@ -1,56 +1,17 @@
 import type { EncryptedBlob } from '../types/chat';
 
-function hasWebCrypto(): boolean {
-  return typeof crypto !== 'undefined' && Boolean(crypto.subtle);
+function requireWebCrypto(): Crypto {
+  if (typeof crypto === 'undefined' || !crypto.subtle || !crypto.getRandomValues) {
+    throw new Error('Peramban tidak mendukung Web Crypto yang aman.');
+  }
+  return crypto;
 }
 
 function getRandomBytes(length: number): Uint8Array<ArrayBuffer> {
   const buf = new ArrayBuffer(length);
   const out = new Uint8Array(buf);
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    crypto.getRandomValues(out);
-    return out;
-  }
-  for (let i = 0; i < length; i++) {
-    out[i] = Math.floor(Math.random() * 256);
-  }
+  requireWebCrypto().getRandomValues(out);
   return out;
-}
-
-function pureJsHashBytes(input: Uint8Array, outLen = 32): Uint8Array<ArrayBuffer> {
-  const buf = new ArrayBuffer(outLen);
-  const out = new Uint8Array(buf);
-  let h1 = 0x811c9dc5;
-  let h2 = 0x9e3779b9;
-  for (let i = 0; i < input.length; i++) {
-    h1 ^= input[i];
-    h1 = Math.imul(h1, 0x01000193);
-    h2 = Math.imul(h2 ^ input[i], 0x85ebca6b);
-  }
-  for (let i = 0; i < outLen; i++) {
-    h1 = Math.imul(h1 ^ (i + 17), 0x27d4eb2d);
-    h2 = Math.imul(h2 ^ h1, 0x165667b1);
-    out[i] = ((h1 ^ h2) >>> ((i % 4) * 8)) & 0xff;
-  }
-  return out;
-}
-
-function isPlainFallbackKey(key: unknown): key is { __lanPlainKey: true; secret: string } {
-  return Boolean(key && typeof key === 'object' && (key as { __lanPlainKey?: boolean }).__lanPlainKey);
-}
-
-function makePlainFallbackKey(secret = 'lan-shared'): CryptoKey {
-  return { __lanPlainKey: true, secret } as unknown as CryptoKey;
-}
-
-function utf8ToBase64(text: string): string {
-  const bytes = new TextEncoder().encode(text);
-  return bufferToBase64(bytes);
-}
-
-function base64ToUtf8(b64: string): string {
-  const bytes = base64ToUint8Array(b64);
-  return new TextDecoder().decode(bytes);
 }
 
 function bufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
@@ -73,36 +34,14 @@ function base64ToUint8Array(base64: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
-export interface StoredIdentityKeys {
-  publicKeyJwk: JsonWebKey;
-  privateKeyJwk: JsonWebKey;
-  fingerprint: string;
-}
-
 export async function generateIdentityKeyPair(): Promise<{
   publicKey: CryptoKey;
   privateKey: CryptoKey;
   publicKeyJwk: JsonWebKey;
-  privateKeyJwk: JsonWebKey;
   fingerprint: string;
 }> {
-  if (!hasWebCrypto()) {
-    const x = bufferToBase64(getRandomBytes(32));
-    const y = bufferToBase64(getRandomBytes(32));
-    const d = bufferToBase64(getRandomBytes(32));
-    const publicKeyJwk: JsonWebKey = { kty: 'EC', crv: 'P-256', x, y };
-    const privateKeyJwk: JsonWebKey = { kty: 'EC', crv: 'P-256', x, y, d };
-    const fingerprint = await computeKeyFingerprint(publicKeyJwk);
-    return {
-      publicKey: makePlainFallbackKey(x),
-      privateKey: makePlainFallbackKey(d),
-      publicKeyJwk,
-      privateKeyJwk,
-      fingerprint,
-    };
-  }
-
-  const keyPair = await crypto.subtle.generateKey(
+  const webCrypto = requireWebCrypto();
+  const keyPair = await webCrypto.subtle.generateKey(
     {
       name: 'ECDH',
       namedCurve: 'P-256',
@@ -111,24 +50,27 @@ export async function generateIdentityKeyPair(): Promise<{
     ['deriveKey', 'deriveBits'],
   );
 
-  const publicKeyJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
-  const privateKeyJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+  const publicKeyJwk = await webCrypto.subtle.exportKey('jwk', keyPair.publicKey);
+  const privateKeyJwk = await webCrypto.subtle.exportKey('jwk', keyPair.privateKey);
+  const protectedPrivateKey = await webCrypto.subtle.importKey(
+    'jwk',
+    privateKeyJwk,
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false,
+    ['deriveKey', 'deriveBits'],
+  );
   const fingerprint = await computeKeyFingerprint(publicKeyJwk);
 
   return {
     publicKey: keyPair.publicKey,
-    privateKey: keyPair.privateKey,
+    privateKey: protectedPrivateKey,
     publicKeyJwk,
-    privateKeyJwk,
     fingerprint,
   };
 }
 
 export async function importPrivateKey(privateKeyJwk: JsonWebKey): Promise<CryptoKey> {
-  if (!hasWebCrypto()) {
-    return makePlainFallbackKey(privateKeyJwk.d || 'lan-priv');
-  }
-  return crypto.subtle.importKey(
+  return requireWebCrypto().subtle.importKey(
     'jwk',
     privateKeyJwk,
     {
@@ -141,10 +83,7 @@ export async function importPrivateKey(privateKeyJwk: JsonWebKey): Promise<Crypt
 }
 
 export async function importPublicKey(publicKeyJwk: JsonWebKey): Promise<CryptoKey> {
-  if (!hasWebCrypto()) {
-    return makePlainFallbackKey(publicKeyJwk.x || 'lan-pub');
-  }
-  return crypto.subtle.importKey(
+  return requireWebCrypto().subtle.importKey(
     'jwk',
     publicKeyJwk,
     {
@@ -159,9 +98,7 @@ export async function importPublicKey(publicKeyJwk: JsonWebKey): Promise<CryptoK
 export async function computeKeyFingerprint(publicKeyJwk: JsonWebKey): Promise<string> {
   const canonical = `${publicKeyJwk.kty}:${publicKeyJwk.crv}:${publicKeyJwk.x}:${publicKeyJwk.y}`;
   const data = new TextEncoder().encode(canonical);
-  const bytes = hasWebCrypto()
-    ? new Uint8Array(await crypto.subtle.digest('SHA-256', data))
-    : pureJsHashBytes(data, 16);
+  const bytes = new Uint8Array(await requireWebCrypto().subtle.digest('SHA-256', data));
   const hex = Array.from(bytes)
     .slice(0, 8)
     .map((b) => b.toString(16).padStart(2, '0').toUpperCase())
@@ -178,12 +115,9 @@ export async function computeSafetyNumber(
   const sorted = [keyA, keyB].sort().join('|');
   let buffer: ArrayBuffer = new TextEncoder().encode(sorted).buffer as ArrayBuffer;
 
-  if (hasWebCrypto()) {
-    for (let i = 0; i < 8; i++) {
-      buffer = await crypto.subtle.digest('SHA-256', buffer);
-    }
-  } else {
-    buffer = pureJsHashBytes(new Uint8Array(buffer), 32).buffer;
+  const webCrypto = requireWebCrypto();
+  for (let i = 0; i < 8; i++) {
+    buffer = await webCrypto.subtle.digest('SHA-256', buffer);
   }
 
   const bytes = new Uint8Array(buffer);
@@ -200,11 +134,9 @@ export async function deriveSharedAesKey(
   myPrivateKey: CryptoKey,
   peerPublicKeyJwk: JsonWebKey,
 ): Promise<CryptoKey> {
-  if (!hasWebCrypto() || isPlainFallbackKey(myPrivateKey)) {
-    return makePlainFallbackKey(peerPublicKeyJwk.x || 'lan-shared');
-  }
+  const webCrypto = requireWebCrypto();
   const peerPublicKey = await importPublicKey(peerPublicKeyJwk);
-  return crypto.subtle.deriveKey(
+  return webCrypto.subtle.deriveKey(
     {
       name: 'ECDH',
       public: peerPublicKey,
@@ -220,10 +152,7 @@ export async function deriveSharedAesKey(
 }
 
 export async function generateGroupAesKey(): Promise<CryptoKey> {
-  if (!hasWebCrypto()) {
-    return makePlainFallbackKey(bufferToBase64(getRandomBytes(32)));
-  }
-  return crypto.subtle.generateKey(
+  return requireWebCrypto().subtle.generateKey(
     {
       name: 'AES-GCM',
       length: 256,
@@ -234,19 +163,13 @@ export async function generateGroupAesKey(): Promise<CryptoKey> {
 }
 
 export async function exportAesKeyBase64(key: CryptoKey): Promise<string> {
-  if (!hasWebCrypto() || isPlainFallbackKey(key)) {
-    return isPlainFallbackKey(key) ? key.secret : bufferToBase64(getRandomBytes(32));
-  }
-  const raw = await crypto.subtle.exportKey('raw', key);
+  const raw = await requireWebCrypto().subtle.exportKey('raw', key);
   return bufferToBase64(raw);
 }
 
 export async function importAesKeyBase64(base64: string): Promise<CryptoKey> {
-  if (!hasWebCrypto()) {
-    return makePlainFallbackKey(base64);
-  }
   const raw = base64ToUint8Array(base64);
-  return crypto.subtle.importKey(
+  return requireWebCrypto().subtle.importKey(
     'raw',
     raw,
     {
@@ -259,16 +182,10 @@ export async function importAesKeyBase64(base64: string): Promise<CryptoKey> {
 }
 
 export async function encryptPayload<T>(key: CryptoKey, payload: T): Promise<EncryptedBlob> {
-  if (!hasWebCrypto() || isPlainFallbackKey(key)) {
-    return {
-      iv: bufferToBase64(getRandomBytes(12)),
-      ciphertext: utf8ToBase64(JSON.stringify(payload)),
-      algorithm: 'LAN-PLAIN',
-    };
-  }
+  const webCrypto = requireWebCrypto();
   const iv = getRandomBytes(12);
   const encoded = new TextEncoder().encode(JSON.stringify(payload));
-  const encrypted = await crypto.subtle.encrypt(
+  const encrypted = await webCrypto.subtle.encrypt(
     {
       name: 'AES-GCM',
       iv,
@@ -284,12 +201,13 @@ export async function encryptPayload<T>(key: CryptoKey, payload: T): Promise<Enc
 }
 
 export async function decryptPayload<T>(key: CryptoKey, blob: EncryptedBlob): Promise<T> {
-  if (blob.algorithm === 'LAN-PLAIN' || !hasWebCrypto() || isPlainFallbackKey(key)) {
-    return JSON.parse(base64ToUtf8(blob.ciphertext)) as T;
+  if (blob.algorithm !== 'AES-GCM-256') {
+    throw new Error('Pesan tidak dienkripsi dengan algoritme yang didukung.');
   }
+  const webCrypto = requireWebCrypto();
   const iv = base64ToUint8Array(blob.iv);
   const ciphertext = base64ToUint8Array(blob.ciphertext);
-  const decrypted = await crypto.subtle.decrypt(
+  const decrypted = await webCrypto.subtle.decrypt(
     {
       name: 'AES-GCM',
       iv,
@@ -305,14 +223,9 @@ export async function encryptBinaryBuffer(
   key: CryptoKey,
   buffer: ArrayBuffer,
 ): Promise<{ iv: string; data: ArrayBuffer }> {
-  if (!hasWebCrypto() || isPlainFallbackKey(key)) {
-    return {
-      iv: bufferToBase64(getRandomBytes(12)),
-      data: buffer,
-    };
-  }
+  const webCrypto = requireWebCrypto();
   const iv = getRandomBytes(12);
-  const data = await crypto.subtle.encrypt(
+  const data = await webCrypto.subtle.encrypt(
     {
       name: 'AES-GCM',
       iv,
@@ -331,11 +244,9 @@ export async function decryptBinaryBuffer(
   ivBase64: string,
   encrypted: ArrayBuffer,
 ): Promise<ArrayBuffer> {
-  if (!hasWebCrypto() || isPlainFallbackKey(key)) {
-    return encrypted;
-  }
+  const webCrypto = requireWebCrypto();
   const iv = base64ToUint8Array(ivBase64);
-  return crypto.subtle.decrypt(
+  return webCrypto.subtle.decrypt(
     {
       name: 'AES-GCM',
       iv,
@@ -349,11 +260,9 @@ export async function encryptBinaryBufferRaw(
   key: CryptoKey,
   buffer: ArrayBuffer,
 ): Promise<{ iv: Uint8Array<ArrayBuffer>; data: ArrayBuffer }> {
-  if (!hasWebCrypto() || isPlainFallbackKey(key)) {
-    return { iv: getRandomBytes(12), data: buffer };
-  }
+  const webCrypto = requireWebCrypto();
   const iv = getRandomBytes(12);
-  const data = await crypto.subtle.encrypt(
+  const data = await webCrypto.subtle.encrypt(
     {
       name: 'AES-GCM',
       iv,
@@ -369,11 +278,7 @@ export async function decryptBinaryBufferRaw(
   iv: Uint8Array<ArrayBuffer>,
   encrypted: BufferSource,
 ): Promise<ArrayBuffer> {
-  if (!hasWebCrypto() || isPlainFallbackKey(key)) {
-    if (encrypted instanceof ArrayBuffer) return encrypted;
-    return encrypted.buffer.slice(encrypted.byteOffset, encrypted.byteOffset + encrypted.byteLength) as ArrayBuffer;
-  }
-  return crypto.subtle.decrypt(
+  return requireWebCrypto().subtle.decrypt(
     {
       name: 'AES-GCM',
       iv,
@@ -384,9 +289,7 @@ export async function decryptBinaryBufferRaw(
 }
 
 export async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
-  const bytes = hasWebCrypto()
-    ? new Uint8Array(await crypto.subtle.digest('SHA-256', buffer))
-    : pureJsHashBytes(new Uint8Array(buffer), 32);
+  const bytes = new Uint8Array(await requireWebCrypto().subtle.digest('SHA-256', buffer));
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
