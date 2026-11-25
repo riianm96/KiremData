@@ -4,16 +4,87 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
+import 'dotenv/config';
 import { createServer as createViteServer } from 'vite';
 import { WebSocket, WebSocketServer } from 'ws';
 
 const PORT = process.env.NODE_ENV === 'production' ? Number(process.env.PORT || 3000) : 3000;
-const SYNC_ROOT_DIR = path.resolve(os.tmpdir(), 'lokachat-lan-sync');
-fs.mkdirSync(SYNC_ROOT_DIR, { recursive: true });
+const DATA_ROOT_DIR = path.resolve(process.env.KIREMDATA_DATA_DIR || path.join(os.homedir(), '.kiremdata'));
+const SYNC_ROOT_DIR = path.resolve(DATA_ROOT_DIR, 'sync');
+fs.mkdirSync(DATA_ROOT_DIR, { recursive: true, mode: 0o700 });
+fs.mkdirSync(SYNC_ROOT_DIR, { recursive: true, mode: 0o700 });
 
 const FILE_ID_REGEX = /^[a-zA-Z0-9_-]{4,64}$/;
 const MAX_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MB per chunk max for multi-stream LAN transfers
 const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024; // 4 GB max single file
+const STAGED_FILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_COOKIE = 'kiremdata_session';
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const configuredAccessCode = process.env.KIREMDATA_ACCESS_CODE?.trim();
+if (configuredAccessCode && configuredAccessCode.length < 12) {
+  throw new Error('KIREMDATA_ACCESS_CODE harus berisi minimal 12 karakter.');
+}
+const accessCode = configuredAccessCode || crypto.randomBytes(18).toString('base64url');
+const authSessions = new Map<string, number>();
+const authSessionPeerIds = new Map<string, string>();
+const loginFailures = new Map<string, { count: number; blockedUntil: number }>();
+const authCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [token, expiresAt] of authSessions) {
+    if (expiresAt <= now) {
+      authSessions.delete(token);
+      authSessionPeerIds.delete(token);
+    }
+  }
+}, 15 * 60 * 1000);
+authCleanupTimer.unref();
+
+if (!configuredAccessCode) {
+  console.log(`Kode akses KiremData (berubah saat server restart): ${accessCode}`);
+  console.log('Set KIREMDATA_ACCESS_CODE di .env untuk menggunakan kode tetap.');
+}
+
+function getCookieValue(header: string | undefined, cookieName: string): string | undefined {
+  for (const part of (header || '').split(';')) {
+    const [name, ...value] = part.trim().split('=');
+    if (name === cookieName) return value.join('=');
+  }
+  return undefined;
+}
+
+function isAuthenticated(req: http.IncomingMessage): boolean {
+  const token = getCookieValue(req.headers.cookie, SESSION_COOKIE);
+  if (!token) return false;
+  const expiresAt = authSessions.get(token);
+  if (!expiresAt || expiresAt <= Date.now()) {
+    authSessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function getAuthenticatedPeerId(req: http.IncomingMessage): string | undefined {
+  const token = getCookieValue(req.headers.cookie, SESSION_COOKIE);
+  return token ? authSessionPeerIds.get(token) : undefined;
+}
+
+async function cleanupStaleTransferFiles(): Promise<void> {
+  try {
+    const now = Date.now();
+    const entries = await fs.promises.readdir(SYNC_ROOT_DIR, { withFileTypes: true });
+    await Promise.all(entries.map(async (entry) => {
+      if (!entry.isDirectory() || !FILE_ID_REGEX.test(entry.name)) return;
+      const filePath = path.resolve(SYNC_ROOT_DIR, entry.name);
+      if (!filePath.startsWith(SYNC_ROOT_DIR + path.sep)) return;
+      const stat = await fs.promises.stat(filePath).catch(() => null);
+      if (stat && now - stat.mtimeMs > STAGED_FILE_TTL_MS) {
+        await fs.promises.rm(filePath, { recursive: true, force: true });
+      }
+    }));
+  } catch (error) {
+    console.error('Tidak dapat membersihkan file transfer lama:', error);
+  }
+}
 
 interface EncryptedBlob {
   iv: string;
@@ -66,6 +137,7 @@ interface StoredWireMessage {
 
 interface FileSessionMeta {
   fileId: string;
+  ownerPeerId: string;
   name: string;
   size: number;
   mimeType: string;
@@ -92,8 +164,9 @@ const hubFingerprint = computeJwkFingerprint(
   hubPublicKey.export({ format: 'jwk' }) as JsonWebKey,
 );
 
-const PEER_PROFILES_FILE = path.resolve(SYNC_ROOT_DIR, 'peer-profiles.json');
-if (!PEER_PROFILES_FILE.startsWith(SYNC_ROOT_DIR + path.sep)) {
+const PEER_PROFILES_FILE = path.resolve(DATA_ROOT_DIR, 'peer-profiles.json');
+const HUB_STATE_FILE = path.resolve(DATA_ROOT_DIR, 'hub-state.json');
+if (!PEER_PROFILES_FILE.startsWith(DATA_ROOT_DIR + path.sep) || !HUB_STATE_FILE.startsWith(DATA_ROOT_DIR + path.sep)) {
   throw new Error('Path penyimpanan profil peer tidak valid.');
 }
 
@@ -127,8 +200,7 @@ function savePersistedPeerProfiles(): void {
   try {
     const records = Array.from(peersMap.values());
     const tmpFile = `${PEER_PROFILES_FILE}.tmp`;
-    if (!tmpFile.startsWith(SYNC_ROOT_DIR + path.sep)) return;
-    fs.writeFileSync(tmpFile, JSON.stringify(records, null, 2), 'utf8');
+    fs.writeFileSync(tmpFile, JSON.stringify(records, null, 2), { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmpFile, PEER_PROFILES_FILE);
   } catch {
     // Ignore transient disk write failures
@@ -142,6 +214,48 @@ const fileSessions = new Map<string, FileSessionMeta>();
 const clearedBeforeByPeer = new Map<string, Map<string, number>>();
 const deletedIdsByPeer = new Map<string, Set<string>>();
 const messagesStore: StoredWireMessage[] = [];
+const MAX_STORED_MESSAGES = 10_000;
+let hubStateWrite = Promise.resolve();
+
+function persistHubState(): void {
+  const snapshot = JSON.stringify({
+    groups: Array.from(groupsMap.values()),
+    messages: messagesStore,
+  });
+  hubStateWrite = hubStateWrite
+    .then(async () => {
+      const tmpFile = `${HUB_STATE_FILE}.tmp`;
+      await fs.promises.writeFile(tmpFile, snapshot, { encoding: 'utf8', mode: 0o600 });
+      await fs.promises.rename(tmpFile, HUB_STATE_FILE);
+    })
+    .catch((error) => console.error('Gagal menyimpan state KiremData:', error));
+}
+
+function loadPersistedHubState(): void {
+  try {
+    if (!fs.existsSync(HUB_STATE_FILE)) return;
+    const state = JSON.parse(fs.readFileSync(HUB_STATE_FILE, 'utf8')) as {
+      groups?: ServerGroupRecord[];
+      messages?: StoredWireMessage[];
+    };
+    if (Array.isArray(state.groups)) {
+      for (const group of state.groups) {
+        if (group?.id && group.type === 'group' && Array.isArray(group.memberIds)) {
+          groupsMap.set(group.id, group);
+        }
+      }
+    }
+    if (Array.isArray(state.messages)) {
+      for (const message of state.messages.slice(-MAX_STORED_MESSAGES)) {
+        if (message?.id && message.roomId && message.encryptedPayload) messagesStore.push(message);
+      }
+    }
+  } catch (error) {
+    console.error('State KiremData tidak dapat dibaca:', error);
+  }
+}
+
+loadPersistedHubState();
 
 // Active WebSocket sockets mapped to peerId
 const activeSockets = new Map<string, WebSocket>();
@@ -225,6 +339,10 @@ function deliverChatWireMessage(
   };
 
   messagesStore.push(wireMsg);
+  if (messagesStore.length > MAX_STORED_MESSAGES) {
+    messagesStore.splice(0, messagesStore.length - MAX_STORED_MESSAGES);
+  }
+  persistHubState();
 
   if (wireMsg.roomType === 'direct' && wireMsg.recipientId) {
     sendToPeer(wireMsg.recipientId, { type: 'chat:message', payload: wireMsg });
@@ -299,24 +417,83 @@ async function linkToLocalDownloadsDir(completePath: string, rawFileName: string
 }
 
 async function startServer() {
+  await cleanupStaleTransferFiles();
   const app = express();
+  const trustedProxy = process.env.KIREMDATA_TRUST_PROXY?.trim();
+  app.set(
+    'trust proxy',
+    trustedProxy === 'true' ? 'loopback' : trustedProxy && trustedProxy !== 'false' ? trustedProxy : false,
+  );
+  app.use(express.json({ limit: '4mb' }));
+
+  app.get('/api/auth/session', (req, res) => {
+    res.json({ authenticated: isAuthenticated(req) });
+  });
+
+  app.post('/api/auth/login', (req, res) => {
+    const remoteAddress = (req.socket.remoteAddress || '').replace('::ffff:', '');
+    const loopback = remoteAddress === '127.0.0.1' || remoteAddress === '::1';
+    if (!req.secure && !loopback) {
+      res.status(426).json({ error: 'Gunakan HTTPS untuk masuk dari perangkat LAN atau VPN.' });
+      return;
+    }
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const failure = loginFailures.get(ip);
+    if (failure?.blockedUntil && failure.blockedUntil > Date.now()) {
+      res.status(429).json({ error: 'Terlalu banyak percobaan. Coba lagi beberapa menit.' });
+      return;
+    }
+
+    const submittedCode = typeof req.body?.accessCode === 'string' ? req.body.accessCode : '';
+    const expectedHash = crypto.createHash('sha256').update(accessCode).digest();
+    const submittedHash = crypto.createHash('sha256').update(submittedCode).digest();
+    if (!submittedCode || !crypto.timingSafeEqual(expectedHash, submittedHash)) {
+      const count = (failure?.count ?? 0) + 1;
+      loginFailures.set(ip, {
+        count: count >= 10 ? 0 : count,
+        blockedUntil: count >= 10 ? Date.now() + 5 * 60 * 1000 : 0,
+      });
+      res.status(401).json({ error: 'Kode akses tidak valid.' });
+      return;
+    }
+
+    loginFailures.delete(ip);
+    const token = crypto.randomBytes(32).toString('base64url');
+    authSessions.set(token, Date.now() + SESSION_TTL_MS);
+    const secure = req.secure ? '; Secure' : '';
+    res.setHeader(
+      'Set-Cookie',
+      `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure}`,
+    );
+    res.json({ authenticated: true });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const token = getCookieValue(req.headers.cookie, SESSION_COOKIE);
+    if (token) {
+      authSessions.delete(token);
+      authSessionPeerIds.delete(token);
+    }
+    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${req.secure ? '; Secure' : ''}`);
+    res.json({ authenticated: false });
+  });
+
   app.use('/api', (req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Private-Network', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') {
-      res.status(204).end();
+    if (!isAuthenticated(req)) {
+      res.status(401).json({ error: 'Autentikasi diperlukan.' });
       return;
     }
     next();
   });
-  app.use(express.json({ limit: '4mb' }));
 
   // BackgroundSync-compatible HTTP chat delivery endpoint (idempotent with WebSocket chat:message)
   app.post('/api/chat/messages', (req, res) => {
     const body = req.body ?? {};
     const senderId = typeof body.senderId === 'string' ? body.senderId.trim() : '';
+    if (!senderId || senderId !== getAuthenticatedPeerId(req)) {
+      res.status(403).json({ error: 'Identitas perangkat tidak cocok dengan sesi.' });
+      return;
+    }
     if (!senderId || !body.id || !body.roomId || !body.encryptedPayload) {
       res.status(400).json({ error: 'Payload pesan chat tidak valid.' });
       return;
@@ -362,6 +539,7 @@ async function startServer() {
 
   interface LocalSendSessionRecord {
     sessionId: string;
+    ownerPeerId: string;
     tokens: Map<
       string,
       { token: string; fileName: string; size: number; mimeType: string }
@@ -374,6 +552,16 @@ async function startServer() {
 
   // LocalSend v2 Protocol: Prepare upload session and issue per-file tokens
   app.post('/api/localsend/v2/prepare-upload', (req, res) => {
+    const ownerPeerId = getAuthenticatedPeerId(req);
+    if (!ownerPeerId) {
+      res.status(403).json({ error: 'Daftarkan perangkat sebelum menyiapkan transfer.' });
+      return;
+    }
+    for (const [id, oldSession] of localSendSessions) {
+      if (Date.now() - oldSession.createdAt > 24 * 60 * 60 * 1000) {
+        localSendSessions.delete(id);
+      }
+    }
     const filesInput = req.body?.files;
     if (!filesInput || typeof filesInput !== 'object') {
       res.status(400).json({ error: 'Daftar file prepare-upload tidak valid.' });
@@ -418,6 +606,7 @@ async function startServer() {
 
     localSendSessions.set(sessionId, {
       sessionId,
+      ownerPeerId,
       tokens,
       cancelled: false,
       createdAt: Date.now(),
@@ -444,6 +633,10 @@ async function startServer() {
       res.status(403).json({ error: 'Sesi upload tidak valid atau telah dibatalkan.' });
       return;
     }
+    if (session.ownerPeerId !== getAuthenticatedPeerId(req) || senderId !== session.ownerPeerId) {
+      res.status(403).json({ error: 'Sesi upload bukan milik perangkat ini.' });
+      return;
+    }
 
     const tokenMeta = session.tokens.get(fileId);
     if (!tokenMeta || tokenMeta.token !== token) {
@@ -458,9 +651,10 @@ async function startServer() {
     }
 
     try {
-      await fs.promises.mkdir(dir, { recursive: true });
+      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
       const writeStream = fs.createWriteStream(completePath, {
         highWaterMark: 8 * 1024 * 1024,
+        mode: 0o600,
       });
 
       const startedAt = Date.now();
@@ -473,6 +667,7 @@ async function startServer() {
 
       const meta: FileSessionMeta = {
         fileId,
+        ownerPeerId: session.ownerPeerId,
         name: tokenMeta.fileName,
         size: tokenMeta.size,
         mimeType: tokenMeta.mimeType,
@@ -572,7 +767,7 @@ async function startServer() {
   app.post('/api/localsend/v2/cancel', (req, res) => {
     const sessionId = String(req.query.sessionId || req.body?.sessionId || '');
     const session = localSendSessions.get(sessionId);
-    if (session) {
+    if (session && session.ownerPeerId === getAuthenticatedPeerId(req)) {
       session.cancelled = true;
       localSendSessions.delete(sessionId);
     }
@@ -581,6 +776,11 @@ async function startServer() {
 
   // Resumable multi-stream file sync: initialize transfer session with pre-allocated direct-offset target
   app.post('/api/files/init', async (req, res) => {
+    const ownerPeerId = getAuthenticatedPeerId(req);
+    if (!ownerPeerId) {
+      res.status(403).json({ error: 'Daftarkan perangkat sebelum menyiapkan transfer.' });
+      return;
+    }
     const { fileId, name, size, mimeType, totalChunks, chunkSize, sha256 } = req.body ?? {};
     const resolvedChunkSize =
       typeof chunkSize === 'number' ? chunkSize : 2 * 1024 * 1024;
@@ -625,6 +825,10 @@ async function startServer() {
 
     const existing = fileSessions.get(fileId);
     if (existing) {
+      if (existing.ownerPeerId !== ownerPeerId) {
+        res.status(403).json({ error: 'Sesi file bukan milik perangkat ini.' });
+        return;
+      }
       res.json({
         fileId,
         chunkSize: existing.chunkSize,
@@ -635,8 +839,8 @@ async function startServer() {
     }
 
     try {
-      await fs.promises.mkdir(dir, { recursive: true });
-      const handlePromise = fs.promises.open(completePath, 'w+').then(async (fh) => {
+      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+      const handlePromise = fs.promises.open(completePath, 'w+', 0o600).then(async (fh) => {
         if (size > 0) {
           await fh.truncate(size);
         }
@@ -645,6 +849,7 @@ async function startServer() {
 
       const meta: FileSessionMeta = {
         fileId,
+        ownerPeerId,
         name: path.basename(name).slice(0, 180),
         size,
         mimeType: typeof mimeType === 'string' ? mimeType.slice(0, 120) : 'application/octet-stream',
@@ -685,6 +890,7 @@ async function startServer() {
       const dir = resolveFileDir(fileId);
       if (
         !meta ||
+        meta.ownerPeerId !== getAuthenticatedPeerId(req) ||
         !dir ||
         !Number.isInteger(chunkIndex) ||
         chunkIndex < 0 ||
@@ -771,6 +977,10 @@ async function startServer() {
       res.status(404).json({ error: 'Sesi file tidak ditemukan.' });
       return;
     }
+    if (meta.ownerPeerId !== getAuthenticatedPeerId(req)) {
+      res.status(403).json({ error: 'Sesi file bukan milik perangkat ini.' });
+      return;
+    }
     if (typeof sha256 === 'string' && /^[a-f0-9]{64}$/i.test(sha256)) {
       meta.sha256 = sha256;
     }
@@ -835,22 +1045,40 @@ async function startServer() {
 
   server.on('upgrade', (request, socket, head) => {
     try {
+      const origin = request.headers.origin;
+      const expectedOrigin = `http${(request.socket as { encrypted?: boolean }).encrypted ? 's' : ''}://${request.headers.host}`;
       const pathname = new URL(
         request.url || '/',
         `http://${request.headers.host || 'localhost'}`,
       ).pathname;
-      if (pathname === '/ws') {
+      if (
+        pathname === '/ws' &&
+        isAuthenticated(request) &&
+        typeof origin === 'string' &&
+        new URL(origin).host === new URL(expectedOrigin).host
+      ) {
         wss.handleUpgrade(request, socket, head, (ws) => {
           wss.emit('connection', ws, request);
         });
+      } else {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
       }
     } catch {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
       socket.destroy();
     }
   });
 
   wss.on('connection', (ws, req) => {
     let registeredPeerId: string | null = null;
+    const sessionToken = getCookieValue(req.headers.cookie, SESSION_COOKIE);
+    const sessionExpiresAt = sessionToken ? authSessions.get(sessionToken) : undefined;
+    const sessionExpiryTimer = setTimeout(
+      () => ws.close(4401, 'Sesi KiremData kedaluwarsa'),
+      Math.max(1, (sessionExpiresAt ?? Date.now()) - Date.now()),
+    );
+    sessionExpiryTimer.unref();
     const remoteIp = req.socket.remoteAddress?.replace('::ffff:', '') || '127.0.0.1';
 
     ws.on('message', (rawData) => {
@@ -873,6 +1101,16 @@ async function startServer() {
           if (!id || !name || !publicKeyJwk) return;
 
           const requestedId = String(id).slice(0, 80);
+          if (
+            publicKeyJwk.kty !== 'EC' ||
+            publicKeyJwk.crv !== 'P-256' ||
+            typeof publicKeyJwk.x !== 'string' ||
+            typeof publicKeyJwk.y !== 'string'
+          ) {
+            ws.send(JSON.stringify({ type: 'peer:auth_error', payload: { error: 'Kunci perangkat tidak valid.' } }));
+            ws.close(4403, 'Kunci perangkat tidak valid');
+            return;
+          }
           const fingerprint = computeJwkFingerprint(publicKeyJwk);
           const incomingName = String(name).trim().slice(0, 64);
           const incomingPhone = typeof phone === 'string' ? phone.trim().slice(0, 32) : '';
@@ -889,7 +1127,19 @@ async function startServer() {
             }
           }
 
+          const boundPeerId = sessionToken ? authSessionPeerIds.get(sessionToken) : undefined;
+          const existingPeerId = peersMap.get(requestedId);
+          if (
+            (existingPeerId && existingPeerId.fingerprint !== fingerprint) ||
+            (boundPeerId && boundPeerId !== (existing?.id ?? requestedId))
+          ) {
+            ws.send(JSON.stringify({ type: 'peer:auth_error', payload: { error: 'Identitas perangkat ini sudah terdaftar dengan kunci lain.' } }));
+            ws.close(4403, 'Identitas perangkat tidak cocok');
+            return;
+          }
+
           registeredPeerId = existing ? existing.id : requestedId;
+          if (sessionToken) authSessionPeerIds.set(sessionToken, registeredPeerId);
           activeSockets.set(registeredPeerId, ws);
 
           const incomingIsExplicitCustom =
@@ -1064,6 +1314,7 @@ async function startServer() {
             );
             if (idx !== -1) {
               messagesStore.splice(idx, 1);
+              persistHubState();
               const targetMembers = roomId.includes('__')
                 ? roomId.split('__')
                 : groupsMap.get(roomId)?.memberIds ?? [];
@@ -1102,6 +1353,7 @@ async function startServer() {
                 messagesStore.splice(i, 1);
               }
             }
+            persistHubState();
             const targetMembers = roomId.includes('__')
               ? roomId.split('__')
               : groupsMap.get(roomId)?.memberIds ?? [];
@@ -1162,6 +1414,7 @@ async function startServer() {
               }
             }
           }
+          persistHubState();
           return;
         }
 
@@ -1202,6 +1455,7 @@ async function startServer() {
             wrappedGroupKeys: wrappedGroupKeys || {},
           };
           groupsMap.set(newGroup.id, newGroup);
+          persistHubState();
 
           const publicGroup = {
             id: newGroup.id,
@@ -1232,6 +1486,7 @@ async function startServer() {
           if (wrappedKeyForMember) {
             grp.wrappedGroupKeys[memberId] = wrappedKeyForMember;
           }
+          persistHubState();
 
           const publicGroup = {
             id: grp.id,
@@ -1363,21 +1618,20 @@ async function startServer() {
     });
 
     ws.on('close', () => {
+      clearTimeout(sessionExpiryTimer);
       if (registeredPeerId) {
-        activeSockets.delete(registeredPeerId);
-        const p = peersMap.get(registeredPeerId);
-        if (p) {
-          p.online = false;
-          p.lastSeen = Date.now();
-          if (p.isLiveSession) {
-            // Keep peer in list as offline so existing chats remain accessible
+        if (activeSockets.get(registeredPeerId) === ws) {
+          activeSockets.delete(registeredPeerId);
+          const p = peersMap.get(registeredPeerId);
+          if (p) {
             p.online = false;
+            p.lastSeen = Date.now();
           }
+          broadcastToAll({
+            type: 'peer:list',
+            payload: getPublicPeersList(),
+          });
         }
-        broadcastToAll({
-          type: 'peer:list',
-          payload: getPublicPeersList(),
-        });
       }
     });
   });
@@ -1437,7 +1691,7 @@ self.addEventListener('activate', (event) => {
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
-    app.get('/{*path}', (_req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }

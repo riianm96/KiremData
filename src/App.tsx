@@ -60,11 +60,13 @@ import {
   clearRoomMessagesFromCache,
   deleteMessageFromCache,
   enqueueOfflineChatPacket,
+  loadDeviceIdentity,
   loadCachedMessages,
   loadFileBlobFromCache,
   loadOfflineChatOutbox,
   removeOfflineChatPacket,
   saveFileBlobToCache,
+  saveDeviceIdentity,
   saveMessageToCache,
   type PendingChatPacket,
 } from './services/storage';
@@ -103,7 +105,7 @@ const LEGACY_SESSION_KEYS_KEY = 'lokachat_session_jwk_pair';
 const CLEARED_ROOMS_KEY = 'lokachat_cleared_rooms_at';
 const DELETED_MSGS_KEY = 'lokachat_deleted_msg_ids';
 const NOTIF_MODE_KEY = 'lokachat_notification_mode';
-const ENCRYPT_FILES_KEY = 'kiremdata_encrypt_files';
+const ENCRYPT_FILES_KEY = 'kiremdata_encrypt_files_v2';
 const QUICK_SAVE_KEY = 'kiremdata_quick_save';
 const RECEIVE_PIN_KEY = 'kiremdata_receive_pin';
 
@@ -115,7 +117,7 @@ function readEncryptFilesSetting(): boolean {
   } catch {
     // Ignore storage errors
   }
-  return false; // Mode Super (zero file-encryption overhead) active by default
+  return true;
 }
 
 function readQuickSaveSetting(): QuickSaveMode {
@@ -278,6 +280,7 @@ export default function App() {
   const myPublicJwkRef = useRef<JsonWebKey | null>(null);
   const myPeerIdRef = useRef<string>('');
   const myPeerNameRef = useRef<string>('');
+  const identityAuthFailedRef = useRef(false);
   const myPeerPhoneRef = useRef<string>('');
   const myPeerShopNoteRef = useRef<string>('');
   const peersRef = useRef<LanPeer[]>([]);
@@ -665,43 +668,44 @@ export default function App() {
       let privKey: CryptoKey;
       let fingerprint: string;
 
-      const savedKeysRaw = readPersistentItem(DEVICE_KEYS_KEY, LEGACY_SESSION_KEYS_KEY);
-      if (savedKeysRaw) {
-        try {
-          const parsed = JSON.parse(savedKeysRaw);
-          pubJwk = parsed.publicKeyJwk;
-          privKey = await importPrivateKey(parsed.privateKeyJwk);
-          fingerprint = parsed.fingerprint;
-          writePersistentItem(DEVICE_KEYS_KEY, savedKeysRaw, LEGACY_SESSION_KEYS_KEY);
-        } catch {
+      const storedIdentity = await loadDeviceIdentity();
+      if (storedIdentity) {
+        pubJwk = storedIdentity.publicKeyJwk;
+        privKey = storedIdentity.privateKey;
+        fingerprint = storedIdentity.fingerprint;
+      } else {
+        const savedKeysRaw = readPersistentItem(DEVICE_KEYS_KEY, LEGACY_SESSION_KEYS_KEY);
+        if (savedKeysRaw) {
+          try {
+            const parsed = JSON.parse(savedKeysRaw);
+            pubJwk = parsed.publicKeyJwk;
+            privKey = await importPrivateKey(parsed.privateKeyJwk);
+            fingerprint = parsed.fingerprint;
+            await saveDeviceIdentity({
+              publicKeyJwk: pubJwk,
+              privateKey: privKey,
+              fingerprint,
+            });
+            try {
+              localStorage.removeItem(DEVICE_KEYS_KEY);
+              sessionStorage.removeItem(LEGACY_SESSION_KEYS_KEY);
+            } catch {
+              // The non-extractable IndexedDB key remains the preferred copy.
+            }
+          } catch {
+            const gen = await generateIdentityKeyPair();
+            pubJwk = gen.publicKeyJwk;
+            privKey = gen.privateKey;
+            fingerprint = gen.fingerprint;
+            await saveDeviceIdentity({ publicKeyJwk: pubJwk, privateKey: privKey, fingerprint });
+          }
+        } else {
           const gen = await generateIdentityKeyPair();
           pubJwk = gen.publicKeyJwk;
           privKey = gen.privateKey;
           fingerprint = gen.fingerprint;
-          writePersistentItem(
-            DEVICE_KEYS_KEY,
-            JSON.stringify({
-              publicKeyJwk: gen.publicKeyJwk,
-              privateKeyJwk: gen.privateKeyJwk,
-              fingerprint: gen.fingerprint,
-            }),
-            LEGACY_SESSION_KEYS_KEY,
-          );
+          await saveDeviceIdentity({ publicKeyJwk: pubJwk, privateKey: privKey, fingerprint });
         }
-      } else {
-        const gen = await generateIdentityKeyPair();
-        pubJwk = gen.publicKeyJwk;
-        privKey = gen.privateKey;
-        fingerprint = gen.fingerprint;
-        writePersistentItem(
-          DEVICE_KEYS_KEY,
-          JSON.stringify({
-            publicKeyJwk: gen.publicKeyJwk,
-            privateKeyJwk: gen.privateKeyJwk,
-            fingerprint: gen.fingerprint,
-          }),
-          LEGACY_SESSION_KEYS_KEY,
-        );
       }
 
       if (disposed) return;
@@ -865,6 +869,45 @@ export default function App() {
             });
           }
         },
+        onReceiveError: (info) => {
+          const message = 'Validasi transfer terenkripsi gagal. File dibuang dan tidak dianggap selesai.';
+          setTransfers((prev) => {
+            const existing = prev.find((task) => task.fileId === info.fileId);
+            const failed: FileTransferTask = {
+              fileId: info.fileId,
+              roomId: info.roomId,
+              peerId: info.peerId,
+              peerName: info.peerName,
+              fileName: info.fileName,
+              fileSize: info.fileSize,
+              mimeType: info.mimeType,
+              direction: 'receive',
+              transport: 'wifi-direct',
+              status: 'error',
+              transferredBytes: existing?.transferredBytes ?? 0,
+              totalChunks: existing?.totalChunks ?? 1,
+              completedChunks: existing?.completedChunks ?? 0,
+              speedBytesPerSec: 0,
+              sha256: '',
+              verified: false,
+              startedAt: existing?.startedAt ?? Date.now(),
+              errorMessage: message,
+              encrypted: info.encrypted,
+            };
+            return existing
+              ? prev.map((task) => (task.fileId === info.fileId ? failed : task))
+              : [failed, ...prev];
+          });
+          pushToast({
+            id: makeId('toast'),
+            roomId: info.roomId,
+            senderName: info.peerName,
+            roomName: 'Transfer gagal',
+            preview: `${info.fileName}: ${message}`,
+            timestamp: Date.now(),
+            type: 'file',
+          });
+        },
         getRoomOrPeerAesKey: (roomId, senderPeerId) => getRoomAesKey(roomId, senderPeerId),
       });
       rtc.setLocalPeerId(peerId);
@@ -872,7 +915,7 @@ export default function App() {
 
       // 3. Connect WebSocket to Local LAN Hub
       function connectWebSocket() {
-        if (disposed) return;
+        if (disposed || identityAuthFailedRef.current) return;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
         wsRef.current = ws;
@@ -905,6 +948,21 @@ export default function App() {
         ws.onmessage = async (event) => {
           try {
             const packet = JSON.parse(event.data);
+
+            if (packet.type === 'peer:auth_error') {
+              identityAuthFailedRef.current = true;
+              setWsConnected(false);
+              pushToast({
+                id: makeId('toast'),
+                roomId: '',
+                senderName: 'KiremData',
+                roomName: 'Identitas perangkat ditolak',
+                preview: packet.payload?.error || 'Identitas perangkat tidak cocok. Hubungi pengelola sebelum mengatur ulang data browser.',
+                timestamp: Date.now(),
+                type: 'system',
+              });
+              return;
+            }
 
             if (packet.type === 'sync:init') {
               const { selfPeer, peers: serverPeers, groups, messages: wireMessages } = packet.payload;
@@ -1677,13 +1735,15 @@ export default function App() {
 
       // Compute SHA-256 after transfer finishes (skip full-file read for large files in Mode Super)
       const shaHashLimit = shouldEncrypt ? 128 * 1024 * 1024 : 16 * 1024 * 1024;
-      const computePostTransferSha = () =>
-        file.size <= shaHashLimit
-          ? file
-              .arrayBuffer()
-              .then((buf) => sha256Hex(buf))
-              .catch(() => '')
-          : Promise.resolve('');
+      let shaPromise: Promise<string> | null = null;
+      const computePostTransferSha = () => {
+        if (!shaPromise) {
+          shaPromise = file.size <= shaHashLimit
+            ? file.arrayBuffer().then((buf) => sha256Hex(buf)).catch(() => '')
+            : Promise.resolve('');
+        }
+        return shaPromise;
+      };
 
       const recipientId =
         activeRoom.type === 'direct'
@@ -1694,7 +1754,7 @@ export default function App() {
       // Attempt real WebRTC DataChannel Wi-Fi Direct if peer is live session
       let useP2P = false;
       if (
-        preferredTransport === 'wifi-direct' &&
+        (preferredTransport === 'wifi-direct' || shouldEncrypt) &&
         recipientPeer?.isLiveSession &&
         recipientPeer.online &&
         wifiDirectRef.current
@@ -1743,6 +1803,18 @@ export default function App() {
         encrypted: shouldEncrypt,
       };
 
+      if (shouldEncrypt && !useP2P) {
+        setTransfers((prev) => [
+          {
+            ...initialTask,
+            status: 'error',
+            errorMessage: 'File terenkripsi memerlukan koneksi P2P langsung. Matikan enkripsi hanya jika Anda menerima risiko transfer LAN tanpa enkripsi.',
+          },
+          ...prev,
+        ]);
+        return;
+      }
+
       setTransfers((prev) => [initialTask, ...prev]);
 
       // Send chat timeline card immediately so live transfer telemetry appears right away
@@ -1766,6 +1838,7 @@ export default function App() {
       // 1. Direct WebRTC Wi-Fi Direct Turbo Multi-Channel Binary P2P Stream
       if (useP2P && recipientPeer && wifiDirectRef.current) {
         let finalSpeed = 0;
+        const fileSha256 = shouldEncrypt ? await computePostTransferSha() : '';
         const p2pSuccess = await wifiDirectRef.current.sendFileDirect({
           peerId: recipientPeer.id,
           roomId: activeRoom.id,
@@ -1773,7 +1846,7 @@ export default function App() {
           senderName: currentUser.name,
           fileId,
           file,
-          sha256: '',
+          sha256: fileSha256,
           aesKey,
           shouldPauseOrAbort: () => transferControlRef.current.get(fileId) ?? 'run',
           onProgress: (transferredBytes, completedChunks, total, speedBytesPerSec) => {
@@ -1822,6 +1895,21 @@ export default function App() {
           }
           return;
         }
+      }
+
+      if (shouldEncrypt) {
+        setTransfers((prev) =>
+          prev.map((task) =>
+            task.fileId === fileId
+              ? {
+                  ...task,
+                  status: 'error',
+                  errorMessage: 'Koneksi P2P terputus. File terenkripsi tidak dialihkan ke transfer LAN.',
+                }
+              : task,
+          ),
+        );
+        return;
       }
 
       // 2. LocalSend v2 Continuous Binary HTTP Stream (req.pipe(WriteStream) — zero chunk overhead)
@@ -2028,7 +2116,7 @@ export default function App() {
 
       let useP2P = false;
       if (
-        preferredSendTransport === 'wifi-direct' &&
+        (preferredSendTransport === 'wifi-direct' || shouldEncrypt) &&
         targetPeer.isLiveSession &&
         targetPeer.online &&
         wifiDirectRef.current
@@ -2056,6 +2144,28 @@ export default function App() {
           rawFile: q.file,
         };
       });
+
+      if (shouldEncrypt && !useP2P) {
+        setActiveSendSession({
+          sessionId,
+          direction: 'send',
+          peerId: targetPeer.id,
+          peerName: targetPeer.name,
+          peerIp: targetPeer.localIp,
+          peerDeviceName: targetPeer.deviceName,
+          status: 'error',
+          encryptFiles: true,
+          transport: 'lan-sync',
+          files: batchItems.map(({ rawFile: _file, ...item }) => ({
+            ...item,
+            status: 'error',
+            errorMessage: 'File terenkripsi memerlukan koneksi P2P langsung.',
+          })),
+          startedAt: Date.now(),
+          errorMessage: 'Perangkat tujuan belum terhubung lewat P2P. File tidak dikirim tanpa enkripsi.',
+        });
+        return;
+      }
 
       const abortController = new AbortController();
       sendAbortControllersRef.current.set(sessionId, abortController);
@@ -2234,6 +2344,7 @@ export default function App() {
 
       const aesKey = shouldEncrypt ? await getDirectAesKey(targetPeer.id) : null;
 
+      let failedP2PTransfers = 0;
       try {
         if (useP2P && wifiDirectRef.current) {
           const rtc = wifiDirectRef.current;
@@ -2247,7 +2358,9 @@ export default function App() {
               senderName: currentUser.name,
               fileId: item.fileId,
               file: item.rawFile,
-              sha256: '',
+              sha256: shouldEncrypt && item.size <= 128 * 1024 * 1024
+                ? await item.rawFile.arrayBuffer().then((buffer) => sha256Hex(buffer)).catch(() => '')
+                : '',
               aesKey,
               shouldPauseOrAbort: () =>
                 abortController.signal.aborted ? 'abort' : 'run',
@@ -2256,6 +2369,7 @@ export default function App() {
                 updateFileProgress(item.fileId, transferredBytes, speed, 'transferring');
               },
             });
+            if (!ok) failedP2PTransfers += 1;
             updateFileProgress(
               item.fileId,
               ok ? item.size : 0,
@@ -2326,7 +2440,14 @@ export default function App() {
         if (!abortController.signal.aborted) {
           setActiveSendSession((prev) =>
             prev && prev.sessionId === sessionId
-              ? { ...prev, status: 'completed', completedAt: Date.now() }
+              ? {
+                  ...prev,
+                  status: failedP2PTransfers > 0 ? 'error' : 'completed',
+                  errorMessage: failedP2PTransfers > 0
+                    ? 'Satu atau lebih transfer P2P gagal; file terenkripsi tidak dikirim lewat hub.'
+                    : undefined,
+                  completedAt: Date.now(),
+                }
               : prev,
           );
         }
