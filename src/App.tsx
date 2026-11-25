@@ -365,7 +365,13 @@ export default function App() {
 
   useEffect(() => {
     fetch('/api/network-info')
-      .then((res) => (res.ok ? res.json() : null))
+      .then((res) => {
+        if (res.status === 401) {
+          window.dispatchEvent(new Event('kiremdata:auth-required'));
+          return null;
+        }
+        return res.ok ? res.json() : null;
+      })
       .then((data) => {
         if (data) setNetworkInfo(data as NetworkStatusInfo);
       })
@@ -534,6 +540,10 @@ export default function App() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(packet),
           });
+          if (res.status === 401) {
+            window.dispatchEvent(new Event('kiremdata:auth-required'));
+            break;
+          }
           if (res.ok && res.status === 200) {
             await markQueuedMessageDelivered(packet.id);
             deliveredCount++;
@@ -755,9 +765,6 @@ export default function App() {
       const pendingOutbox = await loadOfflineChatOutbox();
       if (!disposed) {
         notifyPendingOutboxCount(pendingOutbox.length);
-        if (pendingOutbox.length > 0 && (typeof navigator === 'undefined' || navigator.onLine)) {
-          void flushOfflineChatOutboxRef.current?.();
-        }
       }
 
       // 2. Setup Wi-Fi Direct Multi-Socket WebRTC DataChannel Manager
@@ -919,8 +926,10 @@ export default function App() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
         wsRef.current = ws;
+        let hadOpened = false;
 
         ws.onopen = () => {
+          hadOpened = true;
           setWsConnected(true);
           const hasCustomName =
             readPersistentItem(DEVICE_CUSTOM_NAME_SET_KEY) === 'true' ||
@@ -942,7 +951,6 @@ export default function App() {
               },
             }),
           );
-          void flushOfflineChatOutboxRef.current?.();
         };
 
         ws.onmessage = async (event) => {
@@ -980,6 +988,7 @@ export default function App() {
                 }
                 setCurrentUser(selfPeer);
               }
+              void flushOfflineChatOutboxRef.current?.();
               peersRef.current = serverPeers;
               setPeers(serverPeers);
 
@@ -1449,12 +1458,31 @@ export default function App() {
           }
         };
 
-        ws.onclose = () => {
+        ws.onclose = (closeEvent) => {
           setWsConnected(false);
-          if (!disposed) {
-            if (reconnectTimer) clearTimeout(reconnectTimer);
-            reconnectTimer = setTimeout(connectWebSocket, 2500);
+          if (disposed || identityAuthFailedRef.current) return;
+          if (!hadOpened || closeEvent.code === 4401) {
+            void fetch('/api/auth/session', { cache: 'no-store' })
+              .then((res) => (res.ok ? res.json() : null))
+              .then((data: { authenticated?: boolean } | null) => {
+                if (disposed) return;
+                if (data && data.authenticated === false) {
+                  identityAuthFailedRef.current = true;
+                  window.dispatchEvent(new Event('kiremdata:auth-required'));
+                  return;
+                }
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(connectWebSocket, 2500);
+              })
+              .catch(() => {
+                if (disposed) return;
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(connectWebSocket, 2500);
+              });
+            return;
           }
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(connectWebSocket, 2500);
         };
       }
 
@@ -1466,8 +1494,9 @@ export default function App() {
         if (state !== WebSocket.OPEN && state !== WebSocket.CONNECTING) {
           if (reconnectTimer) clearTimeout(reconnectTimer);
           connectWebSocket();
+        } else if (state === WebSocket.OPEN) {
+          void flushOfflineChatOutboxRef.current?.();
         }
-        void flushOfflineChatOutboxRef.current?.();
       };
 
       handleVisibilityChange = () => {
@@ -1683,6 +1712,10 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(wirePacket),
         });
+        if (res.status === 401) {
+          window.dispatchEvent(new Event('kiremdata:auth-required'));
+          return;
+        }
         if (res.ok && res.status === 200) {
           await markQueuedMessageDelivered(msgId);
         }
@@ -1750,21 +1783,36 @@ export default function App() {
           ? activeRoom.memberIds.find((id) => id !== currentUser.id)
           : undefined;
       const recipientPeer = recipientId ? peersRef.current.find((p) => p.id === recipientId) : undefined;
+      const targetPeers: LanPeer[] =
+        activeRoom.type === 'direct'
+          ? (recipientPeer ? [recipientPeer] : [])
+          : activeRoom.memberIds
+              .filter((id) => id !== currentUser.id)
+              .map((id) => peersRef.current.find((p) => p.id === id))
+              .filter((p): p is LanPeer => Boolean(p));
+      const onlineTargetPeers = targetPeers.filter((p) => p.isLiveSession && p.online);
 
-      // Attempt real WebRTC DataChannel Wi-Fi Direct if peer is live session
-      let useP2P = false;
+      // Attempt real WebRTC DataChannel Wi-Fi Direct for live direct/group peers
+      const p2pTargets: LanPeer[] = [];
       if (
         (preferredTransport === 'wifi-direct' || shouldEncrypt) &&
-        recipientPeer?.isLiveSession &&
-        recipientPeer.online &&
+        onlineTargetPeers.length > 0 &&
         wifiDirectRef.current
       ) {
-        if (!wifiDirectRef.current.isPeerConnected(recipientPeer.id)) {
-          useP2P = await wifiDirectRef.current.connectToPeer(recipientPeer.id);
-        } else {
-          useP2P = true;
+        const rtc = wifiDirectRef.current;
+        const connectedPeers = await Promise.all(
+          onlineTargetPeers.map(async (peer) => {
+            const connected = rtc.isPeerConnected(peer.id)
+              ? true
+              : await rtc.connectToPeer(peer.id);
+            return connected ? peer : null;
+          }),
+        );
+        for (const peer of connectedPeers) {
+          if (peer) p2pTargets.push(peer);
         }
       }
+      const useP2P = p2pTargets.length > 0;
 
       const actualTransport: TransferTransport = useP2P ? 'wifi-direct' : 'lan-sync';
       const lanChunkSize =
@@ -1804,11 +1852,15 @@ export default function App() {
       };
 
       if (shouldEncrypt && !useP2P) {
+        const errorMessage =
+          activeRoom.type === 'group' && onlineTargetPeers.length === 0
+            ? 'Belum ada anggota grup yang online untuk transfer file P2P terenkripsi. Tunggu anggota online atau matikan E2EE File untuk Mode Super.'
+            : 'File terenkripsi memerlukan koneksi P2P langsung. Matikan enkripsi hanya jika Anda menerima risiko transfer LAN tanpa enkripsi.';
         setTransfers((prev) => [
           {
             ...initialTask,
             status: 'error',
-            errorMessage: 'File terenkripsi memerlukan koneksi P2P langsung. Matikan enkripsi hanya jika Anda menerima risiko transfer LAN tanpa enkripsi.',
+            errorMessage,
           },
           ...prev,
         ]);
@@ -1836,38 +1888,67 @@ export default function App() {
       const aesKey = shouldEncrypt ? await getRoomAesKey(activeRoom.id, recipientId) : null;
 
       // 1. Direct WebRTC Wi-Fi Direct Turbo Multi-Channel Binary P2P Stream
-      if (useP2P && recipientPeer && wifiDirectRef.current) {
-        let finalSpeed = 0;
+      if (useP2P && wifiDirectRef.current) {
+        const rtc = wifiDirectRef.current;
         const fileSha256 = shouldEncrypt ? await computePostTransferSha() : '';
-        const p2pSuccess = await wifiDirectRef.current.sendFileDirect({
-          peerId: recipientPeer.id,
-          roomId: activeRoom.id,
-          senderId: currentUser.id,
-          senderName: currentUser.name,
-          fileId,
-          file,
-          sha256: fileSha256,
-          aesKey,
-          shouldPauseOrAbort: () => transferControlRef.current.get(fileId) ?? 'run',
-          onProgress: (transferredBytes, completedChunks, total, speedBytesPerSec) => {
-            finalSpeed = speedBytesPerSec;
-            setTransfers((prev) =>
-              prev.map((t) =>
-                t.fileId === fileId
-                  ? {
-                      ...t,
-                      transferredBytes,
-                      completedChunks,
-                      totalChunks: total,
-                      speedBytesPerSec,
-                    }
-                  : t,
-              ),
-            );
-          },
+        const peerProgress = new Map<string, { bytes: number; chunks: number; speed: number }>();
+        let totalChunksKnown = initialTotalChunks;
+        let successCount = 0;
+
+        await runConcurrentFileWorkers(p2pTargets, 3, async (targetPeer) => {
+          const p2pSuccess = await rtc.sendFileDirect({
+            peerId: targetPeer.id,
+            roomId: activeRoom.id,
+            senderId: currentUser.id,
+            senderName: currentUser.name,
+            fileId,
+            file,
+            sha256: fileSha256,
+            aesKey,
+            shouldPauseOrAbort: () => transferControlRef.current.get(fileId) ?? 'run',
+            onProgress: (transferredBytes, completedChunks, total, speedBytesPerSec) => {
+              totalChunksKnown = total;
+              peerProgress.set(targetPeer.id, {
+                bytes: transferredBytes,
+                chunks: completedChunks,
+                speed: speedBytesPerSec,
+              });
+              let sumBytes = 0;
+              let sumChunks = 0;
+              let sumSpeed = 0;
+              for (const entry of peerProgress.values()) {
+                sumBytes += entry.bytes;
+                sumChunks += entry.chunks;
+                sumSpeed += entry.speed;
+              }
+              const divisor = Math.max(1, p2pTargets.length);
+              setTransfers((prev) =>
+                prev.map((t) =>
+                  t.fileId === fileId
+                    ? {
+                        ...t,
+                        transferredBytes: Math.round(sumBytes / divisor),
+                        completedChunks: Math.round(sumChunks / divisor),
+                        totalChunks: totalChunksKnown,
+                        speedBytesPerSec: sumSpeed / Math.max(1, peerProgress.size),
+                      }
+                    : t,
+                ),
+              );
+            },
+          });
+          if (p2pSuccess) {
+            successCount += 1;
+          }
         });
 
-        if (p2pSuccess) {
+        let finalSpeed = 0;
+        for (const entry of peerProgress.values()) {
+          finalSpeed += entry.speed;
+        }
+        finalSpeed = finalSpeed / Math.max(1, peerProgress.size);
+
+        if (successCount > 0 && (!shouldEncrypt || successCount === p2pTargets.length)) {
           setTransfers((prev) =>
             prev.map((t) =>
               t.fileId === fileId
@@ -1875,6 +1956,8 @@ export default function App() {
                     ...t,
                     status: 'completed',
                     transferredBytes: file.size,
+                    completedChunks: totalChunksKnown,
+                    totalChunks: totalChunksKnown,
                     speedBytesPerSec: finalSpeed,
                     verified: shouldEncrypt,
                     completedAt: Date.now(),
@@ -2503,6 +2586,10 @@ export default function App() {
         return { url: URL.createObjectURL(cached.blob), blob: cached.blob };
       }
       const res = await fetch(`/api/files/${encodeURIComponent(fileId)}`);
+      if (res.status === 401) {
+        window.dispatchEvent(new Event('kiremdata:auth-required'));
+        return null;
+      }
       if (!res.ok) return null;
       const blob = await res.blob();
       localFileRef.current.set(fileId, blob);

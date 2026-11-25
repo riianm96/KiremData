@@ -47,6 +47,9 @@ export async function prepareLocalSendUpload(params: {
   });
 
   if (!res.ok) {
+    if (res.status === 401 && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('kiremdata:auth-required'));
+    }
     const errData = await res.json().catch(() => ({}));
     throw new Error(errData.error || `Gagal prepare-upload (${res.status})`);
   }
@@ -213,6 +216,9 @@ function uploadViaXhrFileStream(params: {
           savedToDiskPath,
         });
       } else {
+        if (xhr.status === 401 && typeof window !== 'undefined') {
+          window.dispatchEvent(new Event('kiremdata:auth-required'));
+        }
         reject(new Error(`Upload gagal (HTTP ${xhr.status})`));
       }
     };
@@ -343,6 +349,9 @@ export async function streamUploadFileViaHttp(params: {
       const [res] = await Promise.all([fetch(url, fetchInit), pipePromise]);
 
       if (!res.ok) {
+        if (res.status === 401 && typeof window !== 'undefined') {
+          window.dispatchEvent(new Event('kiremdata:auth-required'));
+        }
         const httpErr = new Error(`Upload gagal (HTTP ${res.status})`);
         (httpErr as Error & { isHttpStatus?: boolean }).isHttpStatus = true;
         throw httpErr;

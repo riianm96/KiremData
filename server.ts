@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
@@ -416,14 +417,48 @@ async function linkToLocalDownloadsDir(completePath: string, rawFileName: string
   }
 }
 
+function isValidTrustProxyToken(token: string): boolean {
+  if (token === 'loopback' || token === 'linklocal' || token === 'uniquelocal') {
+    return true;
+  }
+  const slashIdx = token.indexOf('/');
+  if (slashIdx === -1) {
+    return net.isIP(token) !== 0;
+  }
+  const ip = token.slice(0, slashIdx);
+  const prefixText = token.slice(slashIdx + 1);
+  if (!/^\d+$/.test(prefixText)) return false;
+  const prefix = Number(prefixText);
+  const ipVersion = net.isIP(ip);
+  if (ipVersion === 4) return prefix >= 0 && prefix <= 32;
+  if (ipVersion === 6) return prefix >= 0 && prefix <= 128;
+  return false;
+}
+
+function resolveTrustProxySetting(raw: string | undefined): boolean | number | string | string[] {
+  const value = raw?.trim();
+  if (!value || value.toLowerCase() === 'false') return false;
+  if (value.toLowerCase() === 'true') return 'loopback';
+  if (/^\d+$/.test(value)) return Number(value);
+
+  const tokens = value
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (tokens.length > 0 && tokens.every(isValidTrustProxyToken)) {
+    return tokens.length === 1 ? tokens[0] : tokens;
+  }
+
+  console.warn(
+    `Nilai KIREMDATA_TRUST_PROXY tidak valid ("${value}"); menggunakan false (hanya koneksi langsung).`,
+  );
+  return false;
+}
+
 async function startServer() {
   await cleanupStaleTransferFiles();
   const app = express();
-  const trustedProxy = process.env.KIREMDATA_TRUST_PROXY?.trim();
-  app.set(
-    'trust proxy',
-    trustedProxy === 'true' ? 'loopback' : trustedProxy && trustedProxy !== 'false' ? trustedProxy : false,
-  );
+  app.set('trust proxy', resolveTrustProxySetting(process.env.KIREMDATA_TRUST_PROXY));
   app.use(express.json({ limit: '4mb' }));
 
   app.get('/api/auth/session', (req, res) => {
@@ -460,10 +495,13 @@ async function startServer() {
     loginFailures.delete(ip);
     const token = crypto.randomBytes(32).toString('base64url');
     authSessions.set(token, Date.now() + SESSION_TTL_MS);
+    const isCrossSiteContext =
+      req.body?.embedded === true || req.headers['sec-fetch-site'] === 'cross-site';
+    const sameSite = req.secure && isCrossSiteContext ? 'SameSite=None; Partitioned' : 'SameSite=Strict';
     const secure = req.secure ? '; Secure' : '';
     res.setHeader(
       'Set-Cookie',
-      `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure}`,
+      `${SESSION_COOKIE}=${token}; HttpOnly; ${sameSite}; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure}`,
     );
     res.json({ authenticated: true });
   });
@@ -474,7 +512,10 @@ async function startServer() {
       authSessions.delete(token);
       authSessionPeerIds.delete(token);
     }
-    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${req.secure ? '; Secure' : ''}`);
+    const isCrossSiteContext =
+      req.body?.embedded === true || req.headers['sec-fetch-site'] === 'cross-site';
+    const sameSite = req.secure && isCrossSiteContext ? 'SameSite=None; Partitioned' : 'SameSite=Strict';
+    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; ${sameSite}; Path=/; Max-Age=0${req.secure ? '; Secure' : ''}`);
     res.json({ authenticated: false });
   });
 

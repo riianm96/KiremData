@@ -27,6 +27,15 @@ export function AccessGate({ children }: AccessGateProps) {
 
   useEffect(() => {
     void checkSession();
+    const handleAuthRequired = () => {
+      setAuthenticated(false);
+      setAccessCode('');
+      setError('Sesi berakhir atau server dimulai ulang. Silakan masuk kembali.');
+    };
+    window.addEventListener('kiremdata:auth-required', handleAuthRequired);
+    return () => {
+      window.removeEventListener('kiremdata:auth-required', handleAuthRequired);
+    };
   }, []);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -34,10 +43,16 @@ export function AccessGate({ children }: AccessGateProps) {
     setBusy(true);
     setError('');
     try {
+      let embedded = false;
+      try {
+        embedded = window.self !== window.top;
+      } catch {
+        embedded = true;
+      }
       const response = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accessCode }),
+        body: JSON.stringify({ accessCode, embedded }),
       });
       const result = (await response.json().catch(() => ({}))) as { error?: string };
       if (!response.ok) throw new Error(result.error || 'Gagal masuk ke KiremData.');
